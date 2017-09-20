@@ -1,0 +1,547 @@
+#!/usr/bin/env python
+#provjeriti za tacke iza prepreka
+import math
+import rospy
+import random
+
+
+from scipy import spatial
+from visualization_msgs.msg import Marker
+from nav_msgs.msg import OccupancyGrid, Odometry
+from geometry_msgs.msg import PointStamped, Point, Pose, PoseArray
+from std_msgs.msg import Bool
+from operator import attrgetter
+
+
+class Wrapper(object):
+    def __init__(self, mapa):
+        self.sirina_pikseli = mapa.info.width
+        self.duzina_pikseli = mapa.info.height
+        self.pocetak_x= mapa.info.origin.position.x
+        self.pocetak_y= mapa.info.origin.position.y
+        self.duzina_m = (abs (mapa.info.origin.position.x))*2
+        self.sirina_m = (abs (mapa.info.origin.position.y))*2
+        self.matrica_pikseli = [[True if j!=0 else False for j in mapa.data[i*self.duzina_pikseli:i*self.duzina_pikseli+self.duzina_pikseli]] for i in reversed(xrange(self.sirina_pikseli))]
+
+    def colision(self,x,y):
+        #self.omjer = 40.0/600.0 dimenzije za 600 i 20 m
+        #piksel_x=int(-14.975*y+299.5)
+        #todo: prosiriti na vise piksela i raspodjelu drugu uzeti tj. seedanje raspodjele
+            #proba=(-12.2, 19.9)
+        piksel_x_lijevo=int(self.sirina_pikseli*(y-0.3-self.pocetak_y)/(-self.sirina_m))
+        piksel_x_desno=int(self.sirina_pikseli*(y+0.3-self.pocetak_y)/(-self.sirina_m))
+        piksel_y_dole=int(self.duzina_pikseli*(x-0.3-self.pocetak_x)/self.duzina_m)
+        piksel_y_gore=int(self.duzina_pikseli*(x+0.3-self.pocetak_x)/self.duzina_m)
+        piksel_x=int(self.sirina_pikseli*(y-self.pocetak_y)/(-self.sirina_m))
+        piksel_y=int(self.duzina_pikseli*(x-self.pocetak_x)/self.duzina_m)
+        if abs(piksel_x) > len(self.matrica_pikseli[0])-1 or abs(piksel_y) > len(self.matrica_pikseli)-1:
+            #print 'prvo'
+            return True
+        elif abs(piksel_y_dole) > len(self.matrica_pikseli)-1 or abs(piksel_y_gore) > len(self.matrica_pikseli)-1:
+            #print 'drugo'
+            return True
+        elif abs(piksel_x_desno) > len(self.matrica_pikseli[0])-1 or abs(piksel_x_lijevo) > len(self.matrica_pikseli[0])-1:
+            #print 'trece'
+            return True
+        else:
+            #print piksel_x, piksel_y
+            prva = self.matrica_pikseli[piksel_x][piksel_y_dole] or self.matrica_pikseli[piksel_x][piksel_y_gore]
+            druga=self.matrica_pikseli[piksel_x_lijevo][piksel_y] or self.matrica_pikseli[piksel_x_desno][piksel_y]
+            treca=self.matrica_pikseli[piksel_x_lijevo][piksel_y_gore] or self.matrica_pikseli[piksel_x_lijevo][piksel_y_dole]
+            cetvrta=self.matrica_pikseli[piksel_x_desno][piksel_y_gore] or self.matrica_pikseli[piksel_x_desno][piksel_y_dole]
+            return (self.matrica_pikseli[piksel_x][piksel_y] or prva or druga or treca or cetvrta)
+
+    def colision_spoji(self,x,y):
+        #self.omjer = 40.0/600.0
+        piksel_x=int(self.sirina_pikseli*(y-self.pocetak_y)/(-self.sirina_m))
+        piksel_y=int(self.duzina_pikseli*(x-self.pocetak_x)/self.duzina_m)
+        return self.matrica_pikseli[piksel_x][piksel_y]
+
+    def daj_dimenziju_x(self):
+        return self.duzina_m
+    def daj_dimenziju_y(self):
+        return self.sirina_m
+
+
+class Cvor (object):
+    def __init__(self, data):
+        self.data=data
+        self.lista_povezanih=[]
+        self.lista_povezanih_tacaka=[]
+
+    def vec_postoji(self,trenutni):
+        for i in xrange(0,len(self.lista_povezanih_tacaka)):
+            if trenutni.data==self.lista_povezanih_tacaka[i]:
+                return True
+        return False
+
+class A_cvor(object):
+    def __init__(self,cvor):
+        self.data=cvor.data
+        self.lista_povezanih=[]
+        self.lista_povezanih_tacaka=[]
+
+    def edge(self, novi):
+        self.lista_povezanih.append(novi)
+        self.lista_povezanih_tacaka.append(novi.data)
+
+    def vec_postoji(self,trenutni):
+        for i in xrange(0,len(self.lista_povezanih_tacaka)):
+            if trenutni.data==self.lista_povezanih_tacaka[i]:
+                return True
+        return False
+
+    def novi_atributi(self, G = 0.0, H = 0.0):
+        self.G=G
+        self.H=H*100
+        self.F=G+H
+        self.parent=None
+
+    def update_H(self, H, parent):
+        self.H=H*100
+        self.parent=parent
+        self.F=self.H+self.G
+
+    def update_F(self, G, parent):
+        self.G=G
+        self.parent=parent
+        self.F=self.H+self.G
+
+    def __lt__(self,drugi_cvor):
+        return self.F < drugi_cvor.F
+
+    def __iter__(self):
+        cvor=self
+        while cvor != None:
+            yield cvor
+            cvor=cvor.parent
+
+class A_graf(object):
+    def __init__(self):
+        self.lista_cvorova=[]
+        self.lista_tacaka=[]
+
+    def novi_atributi(self):
+        self.closed_nodes=[]
+        self.open_nodes=[]
+
+    def je_li_u_otvorenoj(self,data):
+        for cvor in self.open_nodes:
+            if cvor.data==data:
+                return True
+        return False
+
+    def je_li_u_zatvorenoj(self,data):
+        for cvor in self.closed_nodes:
+            if cvor.data==data:
+                return True
+        return False
+
+    def daj_indeks(self, data):
+        for cvor in self.lista_cvorova:
+            if cvor.data==data:
+                return self.lista_cvorova.index(cvor)
+
+
+
+class Graf (object):
+    def __init__(self):
+        self.lista_cvorova=[]
+        self.lista_tacaka=[]
+
+
+
+x_ciljna=None
+y_ciljna=None
+x_pocetno=-15.0
+y_pocetno=-10.0
+wrapper=None
+epsilon=0.4
+done=0
+stani=None
+graf=None
+a_graf=None
+
+def pokupi(pose):
+    global wrapper
+    wrapper=Wrapper(pose)
+    talker()
+    nadji_susjedne()
+
+def inicijaliziraj(pose):
+    global x_pocetno
+    global y_pocetno
+    x_pocetno=pose.pose.pose.position.x
+    y_pocetno=pose.pose.pose.position.y
+    q=pose.pose.pose.orientation
+
+def ciljna(pose):
+    global x_ciljna
+    global y_ciljna
+    x_ciljna=pose.point.x
+    y_ciljna=pose.point.y
+    loptica=Bool()
+    loptica.data=True
+    stani.publish(loptica)
+    A_star()
+
+def gotovo(nodes):
+    putanjice=Marker()
+    putanjice.type=4
+    putanjice.header.frame_id='odom'
+    #marker_linije.action=marker.ADD
+    putanjice.scale.x=0.3
+    putanjice.color.g=1.0
+    putanjice.color.a=1.0
+
+    putanjica=Marker()
+    putanjica.type=8
+    putanjica.header.frame_id='odom'
+    #marker_tacke.action=marker.ADD
+    putanjica.scale.x=0.3
+    putanjica.scale.y=0.2
+    putanjica.color.g = 1.0
+    putanjica.color.a = 1.0
+
+    pose_array=PoseArray()
+    for i in xrange(0,len(nodes)):
+        tocka=Point()
+        tocka_pose=Pose()
+        tocka_pose.position.x=nodes[i][0]
+        tocka_pose.position.y=nodes[i][1]
+        tocka.x=nodes[i][0]
+        tocka.y=nodes[i][1]
+        putanjica.points.append(tocka)
+        putanjice.points.append(tocka)
+        pose_array.poses.append(tocka_pose)
+    konacni1.publish(putanjica)
+    konacni2.publish(putanjice)
+
+    posalji_niz.publish(pose_array)
+    rate.sleep()
+
+def daj_putanju():
+    global a_graf
+    global x_ciljna
+    global y_ciljna
+    indeks_zadnji=0
+    zapamti_data=a_graf.open_nodes[0].data
+    while (True):
+        print 'najbliza taca'
+        if len(a_graf.open_nodes)-1<0:
+            indeks_zadnji=a_graf.daj_indeks(zapamti)
+            break
+        print a_graf.open_nodes[0].data
+        a_graf.closed_nodes.append(a_graf.open_nodes[0])
+        zapamti=a_graf.open_nodes[0].data
+        if a_graf.open_nodes[0].data==(x_ciljna,y_ciljna):
+            indeks_zadnji=a_graf.daj_indeks((x_ciljna,y_ciljna))
+            break
+        for i in xrange(0,len(a_graf.open_nodes[0].lista_povezanih)):
+            print 'ovo je ok'
+            print a_graf.open_nodes[0].lista_povezanih[i].data
+            if a_graf.je_li_u_zatvorenoj(a_graf.open_nodes[0].lista_povezanih[i].data)==True:
+                continue
+            elif a_graf.je_li_u_otvorenoj(a_graf.open_nodes[0].lista_povezanih[i].data)==False:
+                #indeksic=a_graf.daj_indeks(a_graf.open_nodes[0].lista_povezanih[i].data)
+                udaljenost=euklidska(a_graf.open_nodes[0].lista_povezanih[i].data,(x_ciljna,y_ciljna))
+                a_graf.open_nodes[0].lista_povezanih[i].update_H(udaljenost,a_graf.open_nodes[0])
+                a_graf.open_nodes[0].lista_povezanih[i].update_F((a_graf.open_nodes[0].G+1),a_graf.open_nodes[0])
+                a_graf.open_nodes.append(a_graf.open_nodes[0].lista_povezanih[i])
+            else:
+                #min_cvor = min(a_graf.open_nodes,key=attrgetter('G'))
+                novi_G=(a_graf.open_nodes[0].G+1)
+                #indeksic=a_graf.daj_indeks(a_graf.open_nodes[0].lista_povezanih[i].data)
+                if novi_G < a_graf.open_nodes[0].lista_povezanih[i].G:
+                    udaljenost=euklidska(a_graf.open_nodes[0].lista_povezanih[i].data,(x_ciljna,y_ciljna))
+                    a_graf.open_nodes[0].lista_povezanih[i].update_H(udaljenost,a_graf.open_nodes[0])
+                    a_graf.open_nodes[0].lista_povezanih[i].update_F((a_graf.open_nodes[0].G+1),a_graf.open_nodes[0])
+        a_graf.open_nodes.pop(0)
+        a_graf.open_nodes.sort()
+    print a_graf.lista_cvorova[indeks_zadnji].data
+    posalji=[node.data for node in a_graf.lista_cvorova[indeks_zadnji]]
+    return posalji[::-1]
+
+
+
+
+
+def euklidska(tacka1,tacka2):
+    return math.sqrt((tacka2[1] - tacka1[1]) ** 2 + (tacka2[0] - tacka1[0]) ** 2)
+
+
+def kombinezon(p, q, alpha):
+    assert len(p) == len(q), 'Points must have the same dimension'
+    return tuple([(1 - alpha) * p[i] + alpha * q[i] for i in xrange(len(p))])
+
+def spoji (p1,p2):
+    global epsilon
+    global wrapper
+
+    d=euklidska(p1,p2)
+
+    if d<epsilon:
+        return (1.0,0.0)
+
+    alpha_i=epsilon/d
+    n=int(d/epsilon)
+
+    zapamti=None
+    for i in xrange(1,n):
+        alpha=alpha_i*i
+        novo=kombinezon(p1,p2,alpha)
+        if wrapper.colision(float(novo[0]),float(novo[1])):
+            return None
+        else:
+            zapamti=novo
+    return zapamti
+
+
+def talker():
+    global x_ciljna
+    global y_ciljna
+    global wrapper
+    global epsilon
+    global konacni1
+    global konacni2
+    global done
+    global x_pocetno
+    global y_pocetno
+    global graf
+
+
+    broj_tacaka=200
+    pub = rospy.Publisher('/tackice', Marker, queue_size=10)
+
+    pub1 = rospy.Publisher('/tackice1', Marker, queue_size=10)
+    smoto1 = rospy.Publisher('/linije1', Marker, queue_size=10)
+    smoto2 = rospy.Publisher('/linije2', Marker, queue_size=10)
+
+    rate = rospy.Rate(10)
+
+
+
+
+    marker_linije1=Marker()
+    marker_linije1.type=5
+    marker_linije1.header.frame_id='odom'
+    #marker_linije.action=marker.ADD
+    marker_linije1.scale.x=0.3
+    marker_linije1.color.r=1.0
+    marker_linije1.color.a=1.0
+
+    marker_linije2=Marker()
+    marker_linije2.type=5
+    marker_linije2.header.frame_id='odom'
+    #marker_linije.action=marker.ADD
+    marker_linije2.scale.x=0.3
+    marker_linije2.color.g=1.0
+    marker_linije2.color.a=1.0
+
+    marker_tacke=Marker()
+    marker_tacke.type=8
+    marker_tacke.header.frame_id='odom'
+    #marker_tacke.action=marker.ADD
+    marker_tacke.scale.x=0.5
+    marker_tacke.scale.y=0.5
+    marker_tacke.color.r = 1.0
+    marker_tacke.color.a = 1.0
+
+    marker_tacke1=Marker()
+    marker_tacke1.type=8
+    marker_tacke1.header.frame_id='odom'
+    #marker_tacke.action=marker.ADD
+    marker_tacke1.scale.x=0.3
+    marker_tacke1.scale.y=0.2
+    marker_tacke1.color.g = 1.0
+    marker_tacke1.color.a = 1.0
+
+
+    #pointstamped = PointStamped()
+    kraj_exploit1=0
+    kraj_exploit2=0
+    indeks_pamti1=0
+    indeks_pamti2=0
+
+    graf=Graf()
+
+    for i in range (broj_tacaka):
+        tackice=Point()
+        tackice1=Point()
+
+
+            #todo: provjeriti raspodjelu i oduzeti pola duzine i sirine
+        rand=(random.uniform(float(wrapper.pocetak_x),float(wrapper.duzina_m/2)),random.uniform(float(wrapper.pocetak_y),float(wrapper.sirina_m/2)))
+        if (wrapper.colision(rand[0],rand[1])==False):
+            cvor=Cvor(rand)
+            graf.lista_cvorova.append(cvor)
+            graf.lista_tacaka.append(cvor.data)
+            tackice.x=rand[0]
+            tackice.y=rand[1]
+            marker_tacke.points.append(tackice)
+            pub.publish(marker_tacke)
+            rate.sleep()
+
+def A_star():
+    global x_ciljna
+    global y_ciljna
+    global wrapper
+    global epsilon
+    global konacni1
+    global konacni2
+    global done
+    global x_pocetno
+    global y_pocetno
+    global graf
+    global a_graf
+    a_graf=A_graf()
+    a_graf.novi_atributi()
+
+    smoto1 = rospy.Publisher('/linije1', Marker, queue_size=10)
+    rate = rospy.Rate(10)
+    marker_linije1=Marker()
+    marker_linije1.type=5
+    marker_linije1.header.frame_id='odom'
+    #marker_linije.action=marker.ADD
+    marker_linije1.scale.x=0.3
+    marker_linije1.color.b=1.0
+    marker_linije1.color.a=1.0
+
+    smoto2 = rospy.Publisher('/linije2', Marker, queue_size=10)
+    rate = rospy.Rate(10)
+    marker_linije2=Marker()
+    marker_linije2.type=5
+    marker_linije2.header.frame_id='odom'
+    #marker_linije.action=marker.ADD
+    marker_linije2.scale.x=0.3
+    marker_linije2.color.g=1.0
+    marker_linije2.color.a=1.0
+
+    for cvoric in graf.lista_cvorova:
+        trenutni=A_cvor(cvoric)
+        trenutni.novi_atributi()
+        a_graf.lista_cvorova.append(trenutni)
+        a_graf.lista_tacaka.append(trenutni.data)
+
+    for cvoric in a_graf.lista_cvorova:
+        udaljenost,indeks=spatial.KDTree(a_graf.lista_tacaka).query(cvoric.data,k=8)
+        for i in xrange(0,len(indeks)):
+            if spoji(cvoric.data,a_graf.lista_cvorova[indeks[i]].data) != None and udaljenost[i] != 0:
+                cvoric.edge(a_graf.lista_cvorova[indeks[i]])
+                if a_graf.lista_cvorova[indeks[i]].vec_postoji(cvoric)==False:
+                    a_graf.lista_cvorova[indeks[i]].edge(cvoric)
+
+
+    dodaj_cvoric=Cvor((x_pocetno,y_pocetno))
+    dodaj_cvor=A_cvor(dodaj_cvoric)
+    dodaj_cvor.novi_atributi(H=(euklidska((x_pocetno,y_pocetno),(x_ciljna,y_ciljna))))
+
+    tacka_pocetna=Point()
+    tacka_pocetna.x=dodaj_cvor.data[0]
+    tacka_pocetna.y=dodaj_cvor.data[1]
+    udaljenost,indeks=spatial.KDTree(a_graf.lista_tacaka).query((x_pocetno,y_pocetno),k=8)
+    for i in xrange(0,len(indeks)):
+        tacka_krajnja=Point()
+        if spoji((x_pocetno,y_pocetno), a_graf.lista_cvorova[indeks[i]].data) != None and udaljenost[i] != 0:
+            dodaj_cvor.edge(a_graf.lista_cvorova[indeks[i]])
+            a_graf.lista_cvorova[indeks[i]].edge(dodaj_cvor)
+            tacka_krajnja.x=a_graf.lista_cvorova[indeks[i]].data[0]
+            tacka_krajnja.y=a_graf.lista_cvorova[indeks[i]].data[1]
+            marker_linije2.points.append(tacka_pocetna)
+            marker_linije2.points.append(tacka_krajnja)
+    smoto2.publish(marker_linije2)
+    rate.sleep()
+
+    a_graf.lista_cvorova.append(dodaj_cvor)
+    a_graf.lista_tacaka.append(dodaj_cvor.data)
+    a_graf.open_nodes.append(dodaj_cvor)
+
+    dodaj_cvoric=Cvor((x_ciljna,y_ciljna))
+    dodaj_cvor=A_cvor(dodaj_cvoric)
+    dodaj_cvor.novi_atributi()
+    print dodaj_cvor.G
+
+    tacka_pocetna=Point()
+    tacka_pocetna.x=dodaj_cvor.data[0]
+    tacka_pocetna.y=dodaj_cvor.data[1]
+    udaljenost,indeks=spatial.KDTree(a_graf.lista_tacaka).query((x_ciljna,y_ciljna),k=8)
+    for i in xrange(0,len(indeks)):
+        tacka_krajnja=Point()
+        if spoji((x_ciljna,y_ciljna), a_graf.lista_cvorova[indeks[i]].data) != None and udaljenost[i] != 0:
+            dodaj_cvor.edge(a_graf.lista_cvorova[indeks[i]])
+            a_graf.lista_cvorova[indeks[i]].edge(dodaj_cvor)
+            tacka_krajnja.x=a_graf.lista_cvorova[indeks[i]].data[0]
+            tacka_krajnja.y=a_graf.lista_cvorova[indeks[i]].data[1]
+            marker_linije1.points.append(tacka_pocetna)
+            marker_linije1.points.append(tacka_krajnja)
+    smoto1.publish(marker_linije1)
+    rate.sleep()
+    a_graf.lista_cvorova.append(dodaj_cvor)
+    a_graf.lista_tacaka.append(dodaj_cvor.data)
+
+    putanja=daj_putanju()
+    print putanja
+    gotovo(putanja)
+
+
+
+
+def nadji_susjedne():
+    global x_ciljna
+    global y_ciljna
+    global wrapper
+    global epsilon
+    global konacni1
+    global konacni2
+    global done
+    global x_pocetno
+    global y_pocetno
+    global graf
+
+    smoto = rospy.Publisher('/linije', Marker, queue_size=10)
+    rate = rospy.Rate(10)
+    marker_linije=Marker()
+    marker_linije.type=5
+    marker_linije.header.frame_id='odom'
+    #marker_linije.action=marker.ADD
+    marker_linije.scale.x=0.3
+    marker_linije.color.b=1.0
+    marker_linije.color.a=1.0
+
+    for cvoric in graf.lista_cvorova:
+        tacka_pocetna=Point()
+        tacka_pocetna.x=cvoric.data[0]
+        tacka_pocetna.y=cvoric.data[1]
+        udaljenost,indeks=spatial.KDTree(graf.lista_tacaka).query(cvoric.data,k=8)
+        for i in xrange(0,len(indeks)):
+            tacka_krajnja=Point()
+            if spoji(cvoric.data,graf.lista_cvorova[indeks[i]].data) != None and udaljenost[i] != 0:
+                tacka_krajnja.x=graf.lista_cvorova[indeks[i]].data[0]
+                tacka_krajnja.y=graf.lista_cvorova[indeks[i]].data[1]
+                marker_linije.points.append(tacka_pocetna)
+                marker_linije.points.append(tacka_krajnja)
+        smoto.publish(marker_linije)
+
+        rate.sleep()
+
+
+
+
+if __name__ == '__main__':
+    rospy.init_node('ciljne_tacke_bas', anonymous=True)
+    rate=rospy.Rate(10)
+    rospy.Subscriber("/ciljna_konfiguracija", PointStamped, ciljna)
+    rospy.Subscriber("/map", OccupancyGrid, pokupi)
+    rospy.Subscriber("/base_pose_ground_truth", Odometry, inicijaliziraj)
+    konacni1=rospy.Publisher('/putanjice', Marker, queue_size=10)
+    konacni2=rospy.Publisher('/putanjica', Marker, queue_size=10)
+    posalji_niz=rospy.Publisher('/ciljevi',PoseArray,queue_size=10)
+    stani=rospy.Publisher('/reci_mu_da_stane',Bool,queue_size=10)
+
+
+
+    while wrapper is None or x_ciljna is None:
+        rate.sleep()
+
+    while not rospy.is_shutdown():
+        rospy.spin()
